@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python tests/test_suite.py)",
+      "Bash(python src/scraper.py --help)"
+    ]
+  }
+}
