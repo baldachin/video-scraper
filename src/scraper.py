@@ -52,8 +52,8 @@ HEADERS = {
 
 # 代理配置 (用于TMDB等海外API)
 PROXIES = {
-    'http': 'http://127.0.0.1:7890',
-    'https': 'http://127.0.0.1:7890',
+    'http': 'socks5h://127.0.0.1:10808',
+    'https': 'socks5h://127.0.0.1:10808',
 }
 
 DOUBAN_API = "https://movie.douban.com/j/subject_suggest?q={}"
@@ -173,13 +173,23 @@ def get_all_search_queries(filename):
         queries.append(' '.join(words[:2]))
     if len(words) >= 3:
         queries.append(' '.join(words[:3]))
-    
+
+    # 额外尝试：去掉所有年份（不只在末尾），对含年份中间位置的电影有效
+    no_year_middle = re.sub(r'(?<!\S)(19\d{2}|20\d{2})(?!\S)', '', base_name).strip()
+    no_year_middle = re.sub(r'\s+', ' ', no_year_middle).strip()
+    if no_year_middle and no_year_middle != base_name and no_year_middle not in queries:
+        queries.append(no_year_middle)
+    # 再次简化短名
+    words2 = no_year_middle.split()
+    if len(words2) >= 2:
+        queries.append(' '.join(words2[:2]))
+
     # 移除常见的"II"、"III"等后缀再尝试
-    for suffix in [' II', ' III', ' IV', ' V', ' Part \d+']:
+    for suffix in [r' II', r' III', r' IV', r' V', r' Part \d+']:
         simple = re.sub(suffix, '', base_name, flags=re.IGNORECASE).strip()
         if simple and simple != base_name and simple not in queries:
             queries.append(simple)
-    
+
     # 去重
     seen = set()
     unique_queries = []
@@ -187,7 +197,7 @@ def get_all_search_queries(filename):
         if q and q not in seen:
             seen.add(q)
             unique_queries.append(q)
-    
+
     return unique_queries
 
 def parse_episode_info(filename):
@@ -1604,6 +1614,7 @@ def scrape_movie_to_output(video_path, output_dir, options, scraper=None):
     """
     try:
         video_path = Path(video_path)
+        output_dir = Path(output_dir)
         if scraper is None:
             scraper = DoubanScraper()
 
@@ -1614,10 +1625,15 @@ def scrape_movie_to_output(video_path, output_dir, options, scraper=None):
         log(f"\n{'='*50}")
         log(f"处理电影: {filename}")
 
-        # 1. 搜索TMDB获取电影信息
-        tmdb_result = search_tmdb_poster(query_name, year)
-
-        # 2. 如果TMDB没找到，尝试豆瓣并允许手动输入关键词重试
+        # 1. 搜索TMDB获取电影信息（尝试多个查询词）
+        tmdb_result = None
+        all_queries = get_all_search_queries(filename)
+        for q in all_queries:
+            result = search_tmdb_poster(q, year)
+            if result:
+                tmdb_result = result
+                log(f"TMDB搜索成功: {q}")
+                break
         if not tmdb_result:
             log(f"未在TMDB找到: {query_name}", "WARN")
 
