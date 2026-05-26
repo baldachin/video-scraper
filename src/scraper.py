@@ -21,6 +21,12 @@ from html.parser import HTMLParser
 from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 
+# 导入用户交互模块
+try:
+    from interactive import select_from_results, manual_input, manual_metadata_input
+except ModuleNotFoundError:
+    from src.interactive import select_from_results, manual_input, manual_metadata_input
+
 # 尝试导入可选的视频处理库
 try:
     import cv2
@@ -79,26 +85,58 @@ def sanitize_filename(name):
 
 def extract_name_from_filename(filename):
     """
-    从文件名提取电影/剧集名称
-    例如: The.Kings.Warden.2026.WEB-DL.1080p.X264.mp4 -> The King's Warden
+    从文件名提取电影/剧集核心名称
+    例如:
+      The.Kings.Warden.2026.WEB-DL.1080p.X264.mp4 -> The King's Warden
+      The Drama 2026 1080p WEBRip x264 (2026).mp4 -> The Drama
     """
     name = Path(filename).stem  # 去掉扩展名
-    # 移除常见后缀
+
+    # 将点号转为空格，便于解析
+    name = name.replace('.', ' ').replace('_', ' ')
+
+    # 先移除括号中的年份（更精确的模式）
+    name = re.sub(r'\s*\(\d{4}\)\s*$', '', name, flags=re.IGNORECASE).strip()
+
+    # 年份提取（处理无括号的年份如 "Movie 2026"）
+    year_match = re.search(r'(?<!\S)\d{4}(?!\S)', name)
+    if year_match:
+        after_year = name[year_match.end():].strip()
+        before_year = name[:year_match.start()].strip()
+        if after_year:
+            name = before_year + ' ' + after_year
+        else:
+            name = before_year
+        name = name.strip()
+
+    # 移除常见后缀（按从右到左的优先级）
     patterns = [
-        r'\.WEB-?DL.*$', r'\.BluRay.*$', r'\.HDRip.*$', r'\.DVDRip.*$',
-        r'\.HDTV.*$', r'\.720p$', r'\.1080p$', r'\.4K$', r'\.2160p$',
-        r'\.X264$', r'\.X265$', r'\.H264$', r'\.H265$', r'\.AAC.*$',
-        r'\.DTS.*$', r'\.AC3.*$', r'\.MP3.*$',
-        r'\.Remastered.*$', r'\.Extended.*$', r'\.UNRATED.*$',
-        r'\.DCP.*$', r'\.PROPER.*$', r'\.REPACK.*$',
-        r'\.RERIP.*$', r'\.READNFO.*$', r'\.NFOFiX.*$',
-        r'-DKS2$', r'-DKS$', r'-NYH$', r'-FLA$',  # 移除组名
+        # 编码 (X264, H265等，带空格)
+        r'\s+X264\s*$', r'\s+X265\s*$', r'\s+H264\s*$', r'\s+H265\s*$',
+        # 来源/质量 (WEBRip, BluRay, WEB-DL等，带空格)
+        r'\s+WEB-?DL\s*$', r'\s+BluRay\s*$', r'\s+HDRip\s*$',
+        r'\s+DVDRip\s*$', r'\s+HDTV\s*$', r'\s+WEBRip\s*$',
+        # 分辨率 (1080p, 720p等，带空格)
+        r'\s+720p\s*$', r'\s+1080p\s*$', r'\s+4K\s*$', r'\s+2160p\s*$',
+        # 编码 (带点号)
+        r'\.X264\s*$', r'\.X265\s*$', r'\.H264\s*$', r'\.H265\s*$',
+        # 音频编码
+        r'\.AAC\s*$', r'\.DTS\s*$', r'\.AC3\s*$', r'\.MP3\s*$',
+        # 来源/质量 (带点号)
+        r'\.WEB-?DL\s*$', r'\.BluRay\s*$', r'\.HDRip\s*$', r'\.DVDRip\s*$',
+        r'\.HDTV\s*$', r'\.WEBRip\s*$',
+        # 版本标记
+        r'\.Remastered\s*$', r'\.Extended\s*$', r'\.UNRATED\s*$',
+        r'\.DCP\s*$', r'\.PROPER\s*$', r'\.REPACK\s*$',
+        r'\.RERIP\s*$', r'\.READNFO\s*$', r'\.NFOFiX\s*$',
+        # 去除组名后缀
+        r'-DKS2\s*$', r'-DKS\s*$', r'-NYH\s*$', r'-FLA\s*$',
+        # 去除多语言标记
+        r'\s+China\s*$', r'\s+UK\s*$', r'\s+USA\s*$',
     ]
     for p in patterns:
         name = re.sub(p, '', name, flags=re.IGNORECASE)
-    
-    # 将点号和下划线转为空格
-    name = name.replace('.', ' ').replace('_', ' ')
+
     # 移除多余空格
     name = re.sub(r'\s+', ' ', name).strip()
     return name
@@ -225,14 +263,15 @@ def normalize_series_name(name):
 def is_series_keyword(name):
     """检测是否是系列剧关键词（纪录片、综艺、电视剧等）"""
     name_lower = name.lower()
+    # 更精确的系列检测，避免误判包含 "drama" 的电影名
     series_keywords = [
         'documentary', 'documentaires', '纪录片',
         '综艺', 'variety', 'talk show',
-        'series', 'series', '剧集',
-        '电视剧', 'drama', 'telefilm',
+        '剧集', '电视剧', 'telefilm',
         'anime', 'animation', '动漫',
         'kids', '儿童', '少儿',
-        'real show', '真人秀'
+        'real show', '真人秀',
+        'season ', 's01', 's02', '第', '季',
     ]
     return any(kw in name_lower for kw in series_keywords)
 
@@ -390,7 +429,6 @@ def generate_nfo(info, media_type='movie'):
     # Kodi 要求剧集每集使用 <episodedetails> 标签
     if media_type == 'episode':
         root_tag = 'episodedetails'
-<<<<<<< HEAD
     elif media_type == 'tvshow':
         root_tag = 'tvshow'
     else:
@@ -399,187 +437,159 @@ def generate_nfo(info, media_type='movie'):
     nfo = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
     nfo += f'<{root_tag}>\n'
 
-    # 基本信息
-=======
-    else:
-        root_tag = media_type
-    
-    nfo = '<?xml version="1.0" encoding="UTF-8"?>\n'
-    nfo += f'<{root_tag}>\n'
-    
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
-    if 'title' in info:
+    # 基本信息 - 使用 info.get() 并检查值不为 None
+    if info.get('title') is not None:
         nfo += f'  <title>{escape_xml(info["title"])}</title>\n'
-    if 'originaltitle' in info:
+    if info.get('originaltitle') is not None:
         nfo += f'  <originaltitle>{escape_xml(info["originaltitle"])}</originaltitle>\n'
-<<<<<<< HEAD
-    if 'showtitle' in info:
+    if info.get('showtitle') is not None:
         nfo += f'  <showtitle>{escape_xml(info["showtitle"])}</showtitle>\n'
-    if 'year' in info:
+    if info.get('year') is not None:
         nfo += f'  <year>{info["year"]}</year>\n'
 
-    # 评分
-    if 'rating' in info:
-        nfo += f'  <rating>{info["rating"]}</rating>\n'
-    if 'votes' in info:
-        nfo += f'  <votes>{info["votes"]}</votes>\n'
-    if 'rating' in info and 'votes' in info:
+    # 评分 - 全部检查 None
+    rating = info.get('rating')
+    votes = info.get('votes')
+    if rating is not None:
+        nfo += f'  <rating>{rating}</rating>\n'
+    if votes is not None:
+        nfo += f'  <votes>{votes}</votes>\n'
+    if rating is not None and votes is not None:
         nfo += '  <ratings>\n'
         nfo += f'    <rating default="true" max="10" name="themoviedb">\n'
-        nfo += f'      <value>{info["rating"]}</value>\n'
-        nfo += f'      <votes>{info["votes"]}</votes>\n'
+        nfo += f'      <value>{rating}</value>\n'
+        nfo += f'      <votes>{votes}</votes>\n'
         nfo += '    </rating>\n'
         nfo += '  </ratings>\n'
 
-    # 剧情
-    if 'plot' in info:
-        nfo += f'  <plot>{escape_xml(info["plot"])}</plot>\n'
-    if 'outline' in info:
+    # 剧情 (plot优先，fallback到summary)
+    plot = info.get('plot')
+    if plot is not None:
+        nfo += f'  <plot>{escape_xml(plot)}</plot>\n'
+    elif info.get('summary') is not None:
+        nfo += f'  <plot>{escape_xml(info["summary"])}</plot>\n'
+    if info.get('outline') is not None:
         nfo += f'  <outline>{escape_xml(info["outline"])}</outline>\n'
-    if 'tagline' in info:
+    if info.get('tagline') is not None:
         nfo += f'  <tagline>{escape_xml(info["tagline"])}</tagline>\n'
 
     # 时长和分级
-    if 'runtime' in info:
+    if info.get('runtime') is not None:
         nfo += f'  <runtime>{info["runtime"]}</runtime>\n'
-    if 'mpaa' in info:
+    if info.get('mpaa') is not None:
         nfo += f'  <mpaa>{escape_xml(info["mpaa"])}</mpaa>\n'
-    if 'certification' in info:
+    if info.get('certification') is not None:
         nfo += f'  <certification>{escape_xml(info["certification"])}</certification>\n'
 
     # 媒体标识ID
-    if 'imdb' in info:
+    if info.get('imdb') is not None:
         nfo += f'  <imdbid>{info["imdb"]}</imdbid>\n'
-    if 'tmdbid' in info:
+    if info.get('tmdbid') is not None:
         nfo += f'  <tmdbid>{info["tmdbid"]}</tmdbid>\n'
-    if 'id' in info:
+    if info.get('id') is not None:
         nfo += f'  <id>{info["id"]}</id>\n'
+    # 保留douban_id兼容
+    if info.get('douban_id') is not None and info.get('uniqueids') is None:
+        nfo += f'  <uniqueid default="false" type="douban">{info["douban_id"]}</uniqueid>\n'
 
     # 唯一ID
-    if 'uniqueids' in info:
-        for id_type, id_val in info['uniqueids'].items():
+    uniqueids = info.get('uniqueids')
+    if uniqueids is not None:
+        for id_type, id_val in uniqueids.items():
             default = 'true' if id_type == 'imdb' else 'false'
             nfo += f'  <uniqueid default="{default}" type="{id_type}">{id_val}</uniqueid>\n'
 
     # 国家/地区和首映日期
-    if 'country' in info:
+    if info.get('country') is not None:
         for c in info['country'] if isinstance(info['country'], list) else [info['country']]:
             nfo += f'  <country>{escape_xml(c)}</country>\n'
-    if 'premiered' in info:
+    if info.get('premiered') is not None:
         nfo += f'  <premiered>{info["premiered"]}</premiered>\n'
 
     # 类型
-    if 'genre' in info:
+    if info.get('genre') is not None:
         for g in info['genre'] if isinstance(info['genre'], list) else [info['genre']]:
             nfo += f'  <genre>{escape_xml(g)}</genre>\n'
 
     # 工作室
-    if 'studio' in info:
+    if info.get('studio') is not None:
         for s in info['studio'] if isinstance(info['studio'], list) else [info['studio']]:
             nfo += f'  <studio>{escape_xml(s)}</studio>\n'
 
     # 导演和编剧
-    if 'director' in info:
+    if info.get('director') is not None:
         for d in info['director'] if isinstance(info['director'], list) else [info['director']]:
             if isinstance(d, dict):
                 nfo += f'  <director>{escape_xml(d.get("name", ""))}</director>\n'
             else:
                 nfo += f'  <director>{escape_xml(d)}</director>\n'
-    if 'credits' in info:
+    if info.get('credits') is not None:
         for c in info['credits'] if isinstance(info['credits'], list) else [info['credits']]:
             if isinstance(c, dict):
                 nfo += f'  <credits>{escape_xml(c.get("name", ""))}</credits>\n'
             else:
                 nfo += f'  <credits>{escape_xml(c)}</credits>\n'
 
-    # 演员列表
-    if 'actor' in info:
+    # 演员列表 (支持字典和字符串两种格式)
+    if info.get('actor') is not None:
         for a in info['actor']:
             nfo += '  <actor>\n'
             if isinstance(a, dict):
-                if 'name' in a:
+                if a.get('name') is not None:
                     nfo += f'    <name>{escape_xml(a["name"])}</name>\n'
-                if 'role' in a:
+                if a.get('role') is not None:
                     nfo += f'    <role>{escape_xml(a["role"])}</role>\n'
-                if 'thumb' in a:
+                if a.get('thumb') is not None:
                     nfo += f'    <thumb>{escape_xml(a["thumb"])}</thumb>\n'
-                if 'tmdbid' in a:
+                if a.get('tmdbid') is not None:
                     nfo += f'    <tmdbid>{a["tmdbid"]}</tmdbid>\n'
-                if 'profile' in a:
+                if a.get('profile') is not None:
                     nfo += f'    <profile>{escape_xml(a["profile"])}</profile>\n'
             else:
                 nfo += f'    <name>{escape_xml(str(a))}</name>\n'
             nfo += '  </actor>\n'
 
     # 标签
-    if 'tag' in info:
+    if info.get('tag') is not None:
         for t in info['tag'] if isinstance(info['tag'], list) else [info['tag']]:
             nfo += f'  <tag>{escape_xml(t)}</tag>\n'
 
     # 预告片
-    if 'trailer' in info:
+    if info.get('trailer') is not None:
         nfo += f'  <trailer>{escape_xml(info["trailer"])}</trailer>\n'
 
     # 海报和图片
-    if 'poster' in info:
+    if info.get('poster') is not None:
         nfo += f'  <thumb aspect="poster">{escape_xml(info["poster"])}</thumb>\n'
-    if 'clearlogo' in info:
+    if info.get('clearlogo') is not None:
         nfo += f'  <thumb aspect="clearlogo">{escape_xml(info["clearlogo"])}</thumb>\n'
-    if 'fanart' in info:
+    if info.get('fanart') is not None:
         nfo += '  <fanart>\n'
         nfo += f'    <thumb>{escape_xml(info["fanart"])}</thumb>\n'
         nfo += '  </fanart>\n'
 
-=======
-    if 'year' in info:
-        nfo += f'  <year>{info["year"]}</year>\n'
-    if 'rating' in info:
-        nfo += f'  <rating>{info["rating"]}</rating>\n'
-    if 'outline' in info:
-        nfo += f'  <outline>{escape_xml(info["outline"])}</outline>\n'
-    if 'summary' in info:
-        nfo += f'  <plot>{escape_xml(info["summary"])}</plot>\n'
-    if 'genre' in info:
-        for g in info['genre']:
-            nfo += f'  <genre>{escape_xml(g)}</genre>\n'
-    if 'director' in info:
-        for d in info['director']:
-            nfo += f'  <director>{escape_xml(d)}</director>\n'
-    if 'actor' in info:
-        for a in info['actor']:
-            nfo += f'  <actor>\n    <name>{escape_xml(a)}</name>\n  </actor>\n'
-    if 'imdb' in info:
-        nfo += f'  <imdb>{info["imdb"]}</imdb>\n'
-    if 'douban_id' in info:
-        nfo += f'  <id>{info["douban_id"]}</id>\n'
-    if 'trailer_url' in info:
-        nfo += f'  <trailer>{info["trailer_url"]}</trailer>\n'
-    
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
     # 剧集特有字段
-    if 'season' in info:
+    if info.get('season') is not None:
         nfo += f'  <season>{info["season"]}</season>\n'
-    if 'episode' in info:
+    if info.get('episode') is not None:
         nfo += f'  <episode>{info["episode"]}</episode>\n'
-<<<<<<< HEAD
-    if 'displayseason' in info:
+    if info.get('displayseason') is not None:
         nfo += f'  <displayseason>{info["displayseason"]}</displayseason>\n'
-    if 'displayepisode' in info:
+    if info.get('displayepisode') is not None:
         nfo += f'  <displayepisode>{info["displayepisode"]}</displayepisode>\n'
 
     # 季名称
-    if 'namedseasons' in info:
-        for season_num, season_name in info['namedseasons'].items():
+    namedseasons = info.get('namedseasons')
+    if namedseasons is not None:
+        for season_num, season_name in namedseasons.items():
             nfo += f'  <namedseason number="{season_num}">{escape_xml(season_name)}</namedseason>\n'
 
     # 季海报
-    if 'seasonposters' in info:
-        for season_num, poster_url in info['seasonposters'].items():
+    seasonposters = info.get('seasonposters')
+    if seasonposters is not None:
+        for season_num, poster_url in seasonposters.items():
             nfo += f'  <thumb aspect="poster" season="{season_num}" type="season">{escape_xml(poster_url)}</thumb>\n'
 
-=======
-    
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
     nfo += f'</{root_tag}>\n'
     return nfo
 
@@ -628,44 +638,36 @@ def download_poster(url, output_path, retry_alternatives=True):
 
 def search_tmdb_poster(movie_name, year=None, api_key=None):
     """
-    搜索TMDB获取电影海报
-    返回: poster_url 或 None
+    搜索TMDB获取电影海报和ID
+    返回: dict {'poster_url': str, 'tmdb_id': int} 或 None
     """
     if not api_key:
         api_key = TMDB_API_KEY
     if not api_key:
         return None
-<<<<<<< HEAD
 
-=======
-        
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
     try:
         # 搜索电影
         search_url = "https://api.themoviedb.org/3/search/movie"
         params = {'api_key': api_key, 'query': movie_name, 'language': 'zh-CN'}
         if year:
             params['year'] = str(year)
-<<<<<<< HEAD
 
         resp = requests.get(search_url, params=params, proxies=PROXIES, timeout=20)
-=======
-        
-        resp = requests.get(search_url, params=params, timeout=15)
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
         if resp.status_code == 200:
             data = resp.json()
             if data.get('results') and len(data['results']) > 0:
                 movie = data['results'][0]
                 if movie.get('poster_path'):
                     poster_path = movie['poster_path']
-                    # 使用更大的图片尺寸
-                    return f"https://image.tmdb.org/t/p/w780{poster_path}"
+                    # 返回字典包含poster_url和tmdb_id
+                    return {
+                        'poster_url': f"https://image.tmdb.org/t/p/w780{poster_path}",
+                        'tmdb_id': movie['id']
+                    }
     except Exception as e:
         log(f"TMDB搜索失败: {e}", "WARN")
     return None
-
-<<<<<<< HEAD
 def search_tmdb_tv(tv_name, year=None, api_key=None):
     """
     搜索TMDB获取电视剧信息
@@ -842,8 +844,6 @@ def get_tmdb_episode_details(tv_id, season_num, episode_num, api_key=None):
         log(f"获取剧集详情失败: {e}", "WARN")
     return None
 
-=======
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
 def extract_video_frame(video_path, output_path, timestamp=None):
     """
     从视频中提取一帧作为海报
@@ -1488,7 +1488,6 @@ def process_series(group_key, video_list, scraper, options):
     
     log(f"剧集处理完成: {folder_name}")
 
-<<<<<<< HEAD
 def scrape_directory(input_path, output_path, options, scraper=None):
     """
     主入口函数：扫描输入目录并刮削到输出目录
@@ -1617,22 +1616,56 @@ def scrape_movie_to_output(video_path, output_dir, options, scraper=None):
 
         # 1. 搜索TMDB获取电影信息
         tmdb_result = search_tmdb_poster(query_name, year)
+
+        # 2. 如果TMDB没找到，尝试豆瓣并允许手动输入关键词重试
         if not tmdb_result:
             log(f"未在TMDB找到: {query_name}", "WARN")
-            # 尝试豆瓣搜索
-            result = scraper.search_with_fallback(filename, year)
+
+            # 允许用户手动输入关键词重试（最多3次）
+            retry_count = 0
+            max_retries = 3
+            search_keyword = query_name
+
+            while retry_count < max_retries:
+                # 先尝试豆瓣搜索
+                result = scraper.search_with_fallback(search_keyword, year)
+                if result:
+                    break  # 找到结果
+
+                # 豆瓣也没找到，让用户手动输入关键词
+                manual_keyword = manual_input("搜索失败，请输入替代关键词")
+                if not manual_keyword:
+                    break  # 用户取消
+                search_keyword = manual_keyword
+                retry_count += 1
+
             if not result:
                 log("豆瓣也未找到", "WARN")
-                # 创建错误标记
-                error_file = output_dir / f"{sanitize_filename(query_name)}.scrape_error"
-                error_file.write_text(f"FAILED: not_found\nTIME: {time.strftime('%Y-%m-%d %H:%M:%S')}", encoding='utf-8')
-                return False
+
+                # 如果启用了 --manual 参数，允许手动输入完整资料
+                if options.get('manual'):
+                    manual_result = manual_metadata_input()
+                    if manual_result:
+                        result = manual_result
+                        log("使用手动输入的资料")
+
+                if not result:
+                    error_file = output_dir / f"{sanitize_filename(query_name)}.scrape_error"
+                    error_file.write_text(f"FAILED: not_found\nTIME: {time.strftime('%Y-%m-%d %H:%M:%S')}", encoding='utf-8')
+                    return False
         else:
             log(f"TMDB搜索成功")
 
         # 2. 获取电影详细信息
-        # 从搜索结果中获取TMDB ID
-        details = get_tmdb_movie_details(842675)  # TODO: 需要从搜索结果获取真实ID
+        # 从搜索结果中获取TMDB ID，或使用豆瓣结果
+        if tmdb_result:
+            details = get_tmdb_movie_details(tmdb_result['tmdb_id'])
+        elif result:
+            # 使用豆瓣结果
+            details = result
+        else:
+            details = None
+
         if not details:
             # 使用基本信息构建
             details = {
@@ -1648,7 +1681,7 @@ def scrape_movie_to_output(video_path, output_dir, options, scraper=None):
             }
 
         # 3. 创建电影目录
-        folder_name = sanitize_filename(f"{details.get('title', query_name)} ({details.get('year', year)})")
+        folder_name = sanitize_filename(f"{details.get('title', query_name)} ({details.get('year', year) or '未知年份'})")
         movie_dir = output_dir / folder_name
         movie_dir.mkdir(parents=True, exist_ok=True)
         log(f"创建目录: {folder_name}")
@@ -1672,7 +1705,7 @@ def scrape_movie_to_output(video_path, output_dir, options, scraper=None):
 
             # 下载海报
             if tmdb_result:
-                download_poster(tmdb_result, poster_path)
+                download_poster(tmdb_result['poster_url'], poster_path)
                 log(f"海报已保存: poster.jpg")
 
             # 下载fanart（如果可用）
@@ -1757,14 +1790,14 @@ def scrape_series_to_output(group_key, video_list, output_dir, options, scraper=
             }
 
         # 3. 创建剧集目录
-        series_dir = output_dir / series_name
+        series_dir = output_dir / f"{series_name} ({year})" if year else output_dir / series_name
         series_dir.mkdir(parents=True, exist_ok=True)
-        log(f"创建目录: {series_name}")
+        log(f"创建目录: {series_dir.name}")
 
-        # 4. 下载海报和fanart
+        # 4. 下载海报和fanart（使用统一命名格式）
         if options.get('poster'):
-            poster_path = series_dir / 'poster.jpg'
-            fanart_path = series_dir / 'fanart.jpg'
+            poster_path = series_dir / f"{series_name} ({year})-poster.jpg" if year else series_dir / f"{series_name}-poster.jpg"
+            fanart_path = series_dir / f"{series_name} ({year})-fanart.jpg" if year else series_dir / f"{series_name}-fanart.jpg"
 
             if details.get('poster_path'):
                 poster_url = f"https://image.tmdb.org/t/p/original{details['poster_path']}"
@@ -1774,7 +1807,7 @@ def scrape_series_to_output(group_key, video_list, output_dir, options, scraper=
                 fanart_url = f"https://image.tmdb.org/t/p/original{details['backdrop_path']}"
                 download_poster(fanart_url, fanart_path)
 
-        # 5. 生成tvshow.nfo
+        # 5. 生成tvshow.nfo和副本（使用统一命名格式）
         if options.get('nfo'):
             tvshow_nfo = series_dir / 'tvshow.nfo'
             nfo_content = generate_nfo(details, 'tvshow')
@@ -1782,7 +1815,8 @@ def scrape_series_to_output(group_key, video_list, output_dir, options, scraper=
                 f.write(nfo_content)
 
             # 生成副本
-            series_nfo = series_dir / f"{series_name}.nfo"
+            series_nfo_name = f"{series_name} ({year}).nfo" if year else f"{series_name}.nfo"
+            series_nfo = series_dir / series_nfo_name
             with open(series_nfo, 'w', encoding='utf-8') as f:
                 f.write(nfo_content)
 
@@ -1790,7 +1824,7 @@ def scrape_series_to_output(group_key, video_list, output_dir, options, scraper=
         # 按季分组
         seasons = defaultdict(list)
         for vf_info in video_list:
-            season_num = vf_info.get('season', 1)
+            season_num = vf_info.get('season') or 1
             seasons[season_num].append(vf_info)
 
         for season_num, season_videos in sorted(seasons.items()):
@@ -1807,7 +1841,7 @@ def scrape_series_to_output(group_key, video_list, output_dir, options, scraper=
                         break
 
             for vf_info in season_videos:
-                episode_num = vf_info.get('episode', 1)
+                episode_num = vf_info.get('episode') or 1
                 video_path = Path(vf_info['path'])
 
                 # 获取单集信息
@@ -1862,20 +1896,16 @@ def main():
     parser = argparse.ArgumentParser(description='视频刮削工具 - 类似tinyMediaManager')
     parser.add_argument('--input', '-i', required=True, help='输入目录或文件路径')
     parser.add_argument('--output', '-o', required=True, help='输出目录路径')
-=======
-def main():
-    parser = argparse.ArgumentParser(description='视频刮削工具 - 类似tinyMediaManager')
-    parser.add_argument('path', nargs='?', default='.', help='视频文件或目录路径')
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
     parser.add_argument('--poster', '-p', action='store_true', help='下载海报')
     parser.add_argument('--nfo', '-n', action='store_true', help='生成NFO文件')
     parser.add_argument('--rename', '-r', action='store_true', help='重命名文件')
     parser.add_argument('--all', '-a', action='store_true', help='执行全部操作')
     parser.add_argument('--force', '-f', action='store_true', help='强制处理未匹配的文件')
-<<<<<<< HEAD
     parser.add_argument('--copy', '-c', action='store_true', help='复制模式（不移动原文件）')
     parser.add_argument('--verbose', '-v', action='store_true', help='详细输出')
     parser.add_argument('--check', action='store_true', help='检查目录完整性并自动修复')
+    parser.add_argument('--extract-frame', '-e', action='store_true', help='即使有刮削数据也从视频提取帧作为海报')
+    parser.add_argument('--manual', '-m', action='store_true', help='搜索失败时允许手动输入完整资料')
 
     args = parser.parse_args()
 
@@ -1884,28 +1914,15 @@ def main():
         check_directory_completeness(args.input, {'poster': True, 'nfo': True})
         return
 
-=======
-    parser.add_argument('--verbose', '-v', action='store_true', help='详细输出')
-    parser.add_argument('--check', '-c', action='store_true', help='检查目录完整性并自动修复')
-    parser.add_argument('--extract-frame', '-e', action='store_true', help='即使有刮削数据也从视频提取帧作为海报')
-    
-    args = parser.parse_args()
-    
-    # 如果是检查模式，直接执行检查
-    if args.check:
-        check_directory_completeness(args.path, {'poster': True, 'nfo': True})
-        return
-    
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
     # 设置选项
     options = {
         'poster': args.poster or args.all,
         'nfo': args.nfo or args.all,
         'rename': args.rename or args.all,
         'force': args.force,
-<<<<<<< HEAD
         'copy': args.copy,
-        'extract_frame': False
+        'extract_frame': args.extract_frame,
+        'manual': args.manual
     }
 
     if not any([options['poster'], options['nfo'], options['rename']]):
@@ -1915,65 +1932,6 @@ def main():
 
     # 调用主处理函数
     scrape_directory(args.input, args.output, options)
-=======
-        'extract_frame': args.extract_frame
-    }
-    
-    if not any([options['poster'], options['nfo'], options['rename']]):
-        parser.print_help()
-        print("\n示例: python3 scraper.py . --all")
-        print("示例: python3 scraper.py . --check  (检查目录完整性)")
-        return
-    
-    scraper = DoubanScraper()
-    target_path = Path(args.path)
-    
-    # 收集所有视频文件
-    video_files = []
-    video_exts = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv']
-    
-    if target_path.is_file():
-        if target_path.suffix.lower() in video_exts:
-            video_files.append(target_path)
-    elif target_path.is_dir():
-        for video_file in target_path.rglob('*'):
-            if video_file.is_file() and video_file.suffix.lower() in video_exts:
-                video_files.append(video_file)
-    else:
-        log(f"路径不存在: {target_path}", "ERROR")
-        return
-    
-    if not video_files:
-        log("未找到视频文件", "WARN")
-        return
-    
-    log(f"找到 {len(video_files)} 个视频文件")
-    
-    # 按剧集分组
-    groups = group_videos_by_series(video_files)
-    log(f"分为 {len(groups)} 个组")
-    
-    # 处理每个组
-    for group_key, video_list in groups.items():
-        # 判断是电影还是剧集
-        is_series = any(v['season'] is not None for v in video_list)
-        
-        # 或者名称中包含系列剧关键词
-        base_name = video_list[0]['base_name'] if video_list else ''
-        if is_series_keyword(base_name):
-            is_series = True
-        
-        if is_series and len(video_list) > 1:
-            # 剧集处理
-            process_series(group_key, video_list, scraper, options)
-        else:
-            # 单部电影处理
-            for vf_info in video_list:
-                process_movie(vf_info, scraper, options)
-    
-    log(f"\n{'='*50}")
-    log("全部处理完成!")
->>>>>>> b3228797a0581b6c962188d001a89aec7ab003a2
 
 if __name__ == '__main__':
     main()
